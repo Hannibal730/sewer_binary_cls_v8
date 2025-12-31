@@ -16,6 +16,7 @@ import logging
 from datetime import datetime
 import random
 import time 
+import shutil
 from models import Model as DecoderBackbone, PatchConvEncoder, Classifier, HybridModel
 
 try:
@@ -40,6 +41,9 @@ try:
     from onnx_utils import evaluate_onnx, measure_onnx_performance, measure_model_flops
 except ImportError:
     onnxruntime = None
+
+import warnings
+warnings.filterwarnings("ignore", message="Glyph") 
 
 from plot import plot_and_save_train_val_accuracy_graph, plot_and_save_val_accuracy_graph, plot_and_save_confusion_matrix, plot_and_save_attention_maps, plot_and_save_f1_normal_graph, plot_and_save_loss_graph, plot_and_save_lr_graph, plot_and_save_compiled_graph
 
@@ -161,24 +165,20 @@ def log_model_parameters(model):
     def count_parameters(m):
         return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
-    # Encoder 내부를 세분화하여 파라미터 계산
-    # 1. Encoder (PatchConvEncoder) 내부 파라미터 계산
-    cnn_feature_extractor = model.encoder.shared_conv[0]
+    # Encoder (PatchConvEncoder) 내부 파라미터 계산
+    cnn_feature_extractor = model.encoder.feature_extractor
     conv_front_params = count_parameters(cnn_feature_extractor.conv_front)
     conv_1x1_params = count_parameters(cnn_feature_extractor.conv_1x1)
-    patch_mixer_params = count_parameters(model.encoder.patch_mixer)
+    token_mixer_params = count_parameters(model.encoder.token_mixer)
     encoder_norm_params = count_parameters(model.encoder.norm)
-    encoder_total_params = conv_front_params + conv_1x1_params + patch_mixer_params + encoder_norm_params
+    encoder_total_params = conv_front_params + conv_1x1_params + token_mixer_params + encoder_norm_params
 
-    # 2. Decoder (DecoderBackbone) 내부 파라미터 계산
+    # Decoder (DecoderBackbone) 내부 파라미터 계산
     embedding_module = model.decoder.embedding4decoder
-
-    # Positional Encoding 파라미터 계산
     pe_params = 0
     if hasattr(embedding_module, 'pos_embed') and isinstance(embedding_module.pos_embed, torch.nn.Parameter) and embedding_module.pos_embed.requires_grad:
         pe_params = embedding_module.pos_embed.numel()
     
-    # Learnable Query 파라미터 계산
     query_params = 0
     if hasattr(embedding_module, 'learnable_queries') and embedding_module.learnable_queries.requires_grad:
         query_params = embedding_module.learnable_queries.numel()
@@ -192,15 +192,12 @@ def log_model_parameters(model):
         w_k_init_params = count_parameters(embedding_module.W_K_init)
         w_v_init_params = count_parameters(embedding_module.W_V_init)
 
-    # Embedding4Decoder의 파라미터 총합 (내부 Decoder 레이어 제외)
     embedding4decoder_total_params = w_feat2emb_params + w_q_init_params + w_k_init_params + w_v_init_params + query_params + pe_params
-
-    # Decoder 내부의 트랜스포머 레이어와 최종 프로젝션 레이어 파라미터 계산
     decoder_layers_params = count_parameters(model.decoder.embedding4decoder.decoder)
     decoder_projection4classifier_params = count_parameters(model.decoder.projection4classifier)
     decoder_total_params = embedding4decoder_total_params + decoder_layers_params + decoder_projection4classifier_params
 
-    # 3. Classifier (MLP) 파라미터 계산
+    # Classifier (MLP) 파라미터 계산
     classifier_projection_params = count_parameters(model.classifier.projection)
     classifier_total_params = classifier_projection_params
 
@@ -211,7 +208,7 @@ def log_model_parameters(model):
     logging.info(f"  - Encoder (PatchConvEncoder):         {encoder_total_params:,} 개")
     logging.info(f"    - conv_front (CNN Backbone):        {conv_front_params:,} 개")
     logging.info(f"    - 1x1_conv (Channel Proj):          {conv_1x1_params:,} 개")
-    logging.info(f"    - patch_mixer (Depthwise Conv):     {patch_mixer_params:,} 개")
+    logging.info(f"    - token_mixer (Depthwise Conv):     {token_mixer_params:,} 개")
     logging.info(f"    - norm (LayerNorm):                 {encoder_norm_params:,} 개")
     logging.info(f"  - Decoder (Cross-Attention-based):    {decoder_total_params:,} 개")
     logging.info(f"    - Embedding Layer (W_feat2emb):     {w_feat2emb_params:,} 개")
@@ -219,7 +216,6 @@ def log_model_parameters(model):
     logging.info(f"    - Init Key Proj (W_K_init):         {w_k_init_params:,} 개")
     logging.info(f"    - Init Value Proj (W_V_init):       {w_v_init_params:,} 개")
     logging.info(f"    - Learnable Queries:                {query_params:,} 개")
-    # logging.info(f"    - Positional Encoding (learnable):  {pe_params:,} 개")
     logging.info(f"    - Decoder Layers (Cross-Attention): {decoder_layers_params:,} 개")
     logging.info(f"    - Projection4Classifier:            {decoder_projection4classifier_params:,} 개")
     logging.info(f"  - Classifier (Projection MLP):        {classifier_total_params:,} 개")
@@ -452,7 +448,7 @@ def train(run_cfg, train_cfg, model, optimizer, scheduler, train_loader, valid_l
         if not (use_warmup and epoch < warmup_epochs) and scheduler:
             scheduler.step() # Warmup 기간이 아닐 때 스케줄러 step 호출
 
-def inference(run_cfg, model_cfg, model, data_loader, device, run_dir_path, timestamp, mode_name="Inference", class_names=None):
+def inference(run_cfg, model_cfg, model, data_loader, device, run_dir_path, timestamp, misclassified_dir=None, mode_name="Inference", class_names=None):
     """저장된 모델을 불러와 추론 시 GPU 메모리 사용량을 측정하고, 테스트셋 성능을 평가합니다."""
     
     # --- ONNX 모델 직접 평가 분기 ---
@@ -529,7 +525,9 @@ def inference(run_cfg, model_cfg, model, data_loader, device, run_dir_path, time
                 encoded_features = model.encoder(single_dummy_input)
                 encoder_end_event.record()
                 # 2. Decoder 구간
-                decoded_features = model.decoder(encoded_features)
+                grid_h = getattr(model.encoder, 'grid_size_h', None)
+                grid_w = getattr(model.encoder, 'grid_size_w', None)
+                decoded_features = model.decoder(encoded_features, grid_h=grid_h, grid_w=grid_w)
                 decoder_end_event.record()
                 # 3. Classifier 구간
                 _ = model.classifier(decoded_features)
@@ -577,7 +575,6 @@ def inference(run_cfg, model_cfg, model, data_loader, device, run_dir_path, time
         avg_inference_time_per_sample = np.mean(iteration_times)
         std_inference_time_per_sample = np.std(iteration_times)
         
-        # FPS 계산 및 통계
         fps_per_iteration = [1000 / t for t in iteration_times if t > 0]
         avg_fps = np.mean(fps_per_iteration) if fps_per_iteration else 0
         std_fps = np.std(fps_per_iteration) if fps_per_iteration else 0
@@ -590,137 +587,158 @@ def inference(run_cfg, model_cfg, model, data_loader, device, run_dir_path, time
     logging.info("테스트 데이터셋에 대한 추론을 시작합니다...")
     
     only_inference_mode = getattr(run_cfg, 'only_inference', False)
+    save_misclassified = getattr(run_cfg, 'save_misclassified', False)
+    
+    all_filenames = []
+    all_predictions_text = []
+    all_confidences = []
+    all_preds_idx = []
+    all_labels_idx = []
+    misclassified_data = []
+    
+    show_log = getattr(run_cfg, 'show_log', True)
+    progress_bar = tqdm(data_loader, desc=f"[{mode_name}]", leave=False, disable=not show_log)
+    
+    with torch.no_grad():
+        for images, labels, filenames in progress_bar:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            
+            probabilities = torch.nn.functional.softmax(outputs, dim=1)
+            confidences, predicted_indices = torch.max(probabilities, 1)
+            
+            all_filenames.extend(filenames)
+            all_predictions_text.extend([class_names[p] for p in predicted_indices.cpu().numpy()])
+            all_confidences.extend(confidences.cpu().numpy())
 
+            if not only_inference_mode:
+                all_preds_idx.extend(predicted_indices.cpu().numpy())
+                all_labels_idx.extend(labels.cpu().numpy())
+                
+                # 오분류 데이터 수집
+                if save_misclassified:
+                    misclassified_mask = predicted_indices != labels
+                    if misclassified_mask.any():
+                        misclassified_indices_batch = torch.where(misclassified_mask)[0]
+                        for i in misclassified_indices_batch:
+                            misclassified_data.append({
+                                'filename': os.path.basename(filenames[i]),
+                                'predicted_class': class_names[predicted_indices[i].item()],
+                                'actual_class': class_names[labels[i].item()],
+                                'confidence': confidences[i].item()
+                            })
+
+    final_acc = None
     if only_inference_mode:
         # 순수 추론 모드: 예측 결과만 생성하고 CSV로 저장
-        all_filenames = []
-        all_predictions = []
-        all_attention_maps = []
-        all_confidences = []
-        show_log = getattr(run_cfg, 'show_log', True)
-        progress_bar = tqdm(data_loader, desc=f"[{mode_name}]", leave=False, disable=not show_log)
-        with torch.no_grad():
-            for images, _, filenames in progress_bar:
-                images = images.to(device)
-                outputs = model(images)
-                
-                # Softmax를 적용하여 확률 계산
-                probabilities = torch.nn.functional.softmax(outputs, dim=1)
-                
-                # 가장 높은 확률(confidence)과 해당 인덱스(예측 클래스)를 가져옴
-                confidences, predicted_indices = torch.max(probabilities, 1)
-                
-                all_filenames.extend(filenames)
-                all_predictions.extend([class_names[p] for p in predicted_indices.cpu().numpy()])
-                all_confidences.extend(confidences.cpu().numpy())
-
-                # 어텐션 맵 저장 (시각화를 위해)
-                if model_cfg.save_attention:
-                    all_attention_maps.append(model.decoder.embedding4decoder.decoder.layers[-1].attn.cpu())
-        
-        # 결과를 DataFrame으로 만들어 CSV 파일로 저장
         results_df = pd.DataFrame({
             'filename': all_filenames,
-            'prediction': all_predictions,
+            'prediction': all_predictions_text,
             'confidence': all_confidences
         })
-        results_df['confidence'] = results_df['confidence'].map('{:.4f}'.format) # 소수점 4자리까지 표시
+        results_df['confidence'] = results_df['confidence'].map('{:.4f}'.format)
         result_csv_path = os.path.join(run_dir_path, f'inference_results_{timestamp}.csv')
         results_df.to_csv(result_csv_path, index=False, encoding='utf-8-sig')
         logging.info(f"추론 결과가 '{result_csv_path}'에 저장되었습니다.")
-        final_acc = None # 정확도 없음
-
     else:
-        # 평가 모드: 기존 evaluate 함수 호출
-        # 어텐션 맵을 저장하기 위해 evaluate 함수를 직접 호출하는 대신, 루프를 여기서 실행합니다.
-        eval_results = evaluate(run_cfg, model, data_loader, device, nn.CrossEntropyLoss(), 'crossentropyloss', desc=f"[{mode_name}]", class_names=class_names, log_class_metrics=True)
-        final_acc = eval_results['accuracy']
+        # 평가 모드: 수집된 데이터로 성능 지표 계산
+        if not all_labels_idx:
+            logging.warning("테스트 데이터가 없습니다. 평가를 건너뜁니다.")
+            return None
 
-        # 3. 혼동 행렬 생성 및 저장 (최종 평가 시에만)
-        # evaluate 함수가 이미 혼동 행렬에 필요한 labels와 preds를 반환하므로, 이를 사용합니다.
-        # 단, 어텐션 맵 시각화를 위해 data_loader를 다시 순회해야 합니다.
-        # 여기서는 기존 로직을 유지하고, 어텐션 맵 시각화 부분에서만 수정합니다.
-        if eval_results['labels'] and eval_results['preds']:
-            plot_and_save_confusion_matrix(eval_results['labels'], eval_results['preds'], class_names, run_dir_path, timestamp)
+        accuracy = 100 * np.mean(np.array(all_preds_idx) == np.array(all_labels_idx))
+        f1 = f1_score(all_labels_idx, all_preds_idx, average='macro', zero_division=0)
+        logging.info(f"[{mode_name}] Test Acc: {accuracy:.2f}%")
+
+        precision_per_class = precision_score(all_labels_idx, all_preds_idx, average=None, zero_division=0)
+        recall_per_class = recall_score(all_labels_idx, all_preds_idx, average=None, zero_division=0)
+        f1_per_class = f1_score(all_labels_idx, all_preds_idx, average=None, zero_division=0)
+
+        for i, class_name in enumerate(class_names):
+            log_line = (f"[Metrics for '{class_name}'] | "
+                        f"Precision: {precision_per_class[i]:.4f} | "
+                        f"Recall: {recall_per_class[i]:.4f} | "
+                        f"F1: {f1_per_class[i]:.4f}")
+            logging.info(log_line)
+        
+        final_acc = accuracy
+        # 혼동 행렬 생성
+        plot_and_save_confusion_matrix(all_labels_idx, all_preds_idx, class_names, run_dir_path, timestamp)
 
     # 4. 어텐션 맵 시각화 (설정이 True인 경우)
+    attn_save_dir = None
     if model_cfg.save_attention:
         try:
-            # 1. 어텐션 맵을 저장할 전용 폴더 생성
             attn_save_dir = os.path.join(run_dir_path, f'attention_map_{timestamp}')
             os.makedirs(attn_save_dir, exist_ok=True)
-
             num_to_save = min(getattr(model_cfg, 'num_plot_attention', 10), len(data_loader.dataset))
             logging.info(f"어텐션 맵 시각화를 시작합니다 ({num_to_save}개 샘플, 저장 위치: '{attn_save_dir}').")
 
             saved_count = 0
-            # 데이터 로더를 순회하며 num_to_save 개수만큼 시각화
             for sample_images, sample_labels, sample_filenames in data_loader:
-                if saved_count >= num_to_save:
-                    break
-
+                if saved_count >= num_to_save: break
                 sample_images = sample_images.to(device)
-                batch_size = sample_images.size(0)
-
-                # 모델을 실행하여 어텐션 맵이 저장되도록 함
                 with torch.no_grad():
                     outputs = model(sample_images)
-
                 _, predicted_indices = torch.max(outputs.data, 1)
-                
-                # 모델 실행 후 저장된 어텐션 맵을 가져옵니다.
-                # 이 값은 배치 단위의 어텐션 맵입니다.
                 batch_attention_maps = model.decoder.embedding4decoder.decoder.layers[-1].attn
 
-                # 현재 배치에서 저장해야 할 샘플 수만큼 반복
-                for i in range(batch_size):
-                    if saved_count >= num_to_save:
-                        break
-
-                    predicted_class = class_names[predicted_indices[i].item()]
-                    original_filename = sample_filenames[i]
-                    
-                    actual_class = "Unknown" if only_inference_mode else class_names[sample_labels[i].item()]
-
+                for i in range(sample_images.size(0)):
+                    if saved_count >= num_to_save: break
                     plot_and_save_attention_maps(
                         batch_attention_maps, sample_images, attn_save_dir, model_cfg.img_size, model_cfg,
-                        sample_idx=i, original_filename=original_filename, actual_class=actual_class, predicted_class=predicted_class
+                        sample_idx=i, original_filename=sample_filenames[i],
+                        actual_class="Unknown" if only_inference_mode else class_names[sample_labels[i].item()],
+                        predicted_class=class_names[predicted_indices[i].item()]
                     )
                     saved_count += 1
-            
             logging.info(f"어텐션 맵 {saved_count}개 저장 완료.")
         except Exception as e:
             logging.error(f"어텐션 맵 시각화 중 오류 발생: {e}")
-    # --- ONNX 변환 및 평가 (config.yaml 설정에 따라) ---
+            
+    # 5. 오분류 샘플 저장
+    if save_misclassified and misclassified_data and misclassified_dir:
+        csv_path = os.path.join(misclassified_dir, 'misclassified_files.csv')
+        try:
+            df = pd.DataFrame(misclassified_data)
+            df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+            logging.info(f"오분류 샘플 정보 {len(misclassified_data)}개를 '{csv_path}'에 저장했습니다.")
+
+            if attn_save_dir and os.path.exists(attn_save_dir):
+                logging.info("오분류 샘플의 어텐션 맵을 복사합니다...")
+                copied_count = 0
+                for item in misclassified_data:
+                    filename_no_ext = os.path.splitext(item['filename'])[0]
+                    src_attn_folder = os.path.join(attn_save_dir, filename_no_ext)
+                    dst_attn_folder = os.path.join(misclassified_dir, filename_no_ext)
+                    if os.path.exists(src_attn_folder) and not os.path.exists(dst_attn_folder):
+                        shutil.copytree(src_attn_folder, dst_attn_folder)
+                        copied_count += 1
+                logging.info(f"어텐션 맵 {copied_count}개 복사 완료.")
+        except Exception as e:
+            logging.error(f"오분류 샘플 저장 중 오류 발생: {e}")
+
+    # --- ONNX 변환 및 평가 ---
     evaluate_onnx_flag = getattr(run_cfg, 'evaluate_onnx', False)
     if evaluate_onnx_flag and onnxruntime and dummy_input is not None:
         logging.info("="*50)
         logging.info("ONNX 변환 및 평가를 시작합니다...")
         onnx_path = os.path.join(run_dir_path, f'model_{timestamp}.onnx')
         try:
-            # 모델을 CPU로 이동하여 ONNX로 변환 (일반적으로 더 안정적)
             model.to('cpu')
-            # --- ONNX 런타임 세션 옵션 설정 ---
             sess_options = onnxruntime.SessionOptions()
             sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-
             torch.onnx.export(model, dummy_input.to('cpu'), onnx_path, 
                                 export_params=True, opset_version=14,
                                 do_constant_folding=True,
                                 input_names=['input'], output_names=['output'],
                                 dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}})
-            model.to(device) # 모델을 원래 장치로 복원
-
-            # ONNX 파일 크기 로깅
-            onnx_file_size_bytes = os.path.getsize(onnx_path)
-            onnx_file_size_mb = onnx_file_size_bytes / (1024 * 1024)
+            model.to(device)
+            onnx_file_size_mb = os.path.getsize(onnx_path) / (1024 * 1024)
             logging.info(f"모델이 ONNX 형식으로 변환되어 '{onnx_path}'에 저장되었습니다. (크기: {onnx_file_size_mb:.2f} MB)")
-
-            # ONNX 런타임 세션 생성 및 평가
             onnx_session = onnxruntime.InferenceSession(onnx_path, sess_options=sess_options)
             measure_onnx_performance(onnx_session, dummy_input)
             evaluate_onnx(run_cfg, onnx_session, data_loader, desc=f"[{mode_name} (ONNX)]", class_names=class_names, log_class_metrics=True)
-
         except Exception as e:
             logging.error(f"ONNX 변환 또는 평가 중 오류 발생: {e}")
 
@@ -764,22 +782,33 @@ def main():
         logging.info(f"전역 랜덤 시드를 {global_seed}로 고정합니다.")
 
     # --- 실행 디렉토리 설정 ---
-    if run_cfg.mode == 'train':
-        # 훈련 모드: 새로운 실행 디렉토리 생성
-        run_dir_path, timestamp = setup_logging(run_cfg, data_dir_name) # 여기서 run_dir_path와 timestamp가 반환됨
-    elif run_cfg.mode == 'inference':
-        # ONNX 직접 추론 경로가 설정되었는지 확인
+    run_dir_path, timestamp = setup_logging(run_cfg, data_dir_name)
+    misclassified_dir = None
+    if run_cfg.mode == 'inference' and getattr(run_cfg, 'save_misclassified', False):
+        # ONNX 직접 추론이 아니고, pth_inference_dir가 유효할 때
         onnx_inference_path = getattr(run_cfg, 'onnx_inference_path', None)
         if not (onnx_inference_path and os.path.exists(onnx_inference_path)):
-            # ONNX 경로가 없는 경우에만 pth_inference_dir 경로를 검사합니다.
+            # pth_inference_dir는 setup_logging 이후에 결정되므로 여기서 생성
+            log_root_dir = os.path.dirname(getattr(run_cfg, 'pth_inference_dir', './log'))
+            if os.path.basename(log_root_dir) != data_dir_name:
+                log_root_dir = os.path.join(log_root_dir, data_dir_name)
+
+            misclassified_dir = os.path.join(log_root_dir, f"misclassified_{timestamp}")
+            os.makedirs(misclassified_dir, exist_ok=True)
+            logging.info(f"오분류 샘플 저장 폴더: '{misclassified_dir}'")
+    elif run_cfg.mode == 'train' and getattr(run_cfg, 'save_misclassified', False):
+         misclassified_dir = os.path.join(run_dir_path, f"misclassified_{timestamp}")
+         os.makedirs(misclassified_dir, exist_ok=True)
+         logging.info(f"오분류 샘플 저장 폴더: '{misclassified_dir}'")
+
+
+    if run_cfg.mode == 'inference':
+        onnx_inference_path = getattr(run_cfg, 'onnx_inference_path', None)
+        if not (onnx_inference_path and os.path.exists(onnx_inference_path)):
             run_dir_path = getattr(run_cfg, 'pth_inference_dir', None)
             if getattr(run_cfg, 'show_log', True) and (not run_dir_path or not os.path.isdir(run_dir_path)):
                 logging.error("추론 모드에서는 'config.yaml'에 'pth_inference_dir'를 올바르게 설정해야 합니다.")
                 exit()
-        else:
-            # ONNX 경로가 있으면 pth_inference_dir은 무시하고 현재 디렉토리를 임시로 사용합니다.
-            run_dir_path = '.'
-        _, timestamp = setup_logging(run_cfg, data_dir_name)
     
     # --- 설정 파일 내용 로깅 ---
     config_str = yaml.dump(config, allow_unicode=True, default_flow_style=False, sort_keys=False)
@@ -808,11 +837,17 @@ def main():
     train_loader, valid_loader, test_loader, num_labels, class_names, pos_weight = prepare_data(run_cfg, train_cfg, model_cfg)
 
     # --- 모델 구성 ---
-    # stride를 고려하여 인코더 패치 수 계산
-    num_patches_per_dim = (model_cfg.img_size - model_cfg.patch_size) // model_cfg.stride + 1
-    num_encoder_patches = num_patches_per_dim ** 2
-    logging.info(f"이미지 크기: {model_cfg.img_size}, 패치 크기: {model_cfg.patch_size}, Stride: {model_cfg.stride} -> 인코더 패치 수: {num_encoder_patches}개")
+    num_patches_H = (model_cfg.img_size - model_cfg.patch_size) // model_cfg.stride + 1
+    num_patches_W = (model_cfg.img_size - model_cfg.patch_size) // model_cfg.stride + 1
     
+    encoder = PatchConvEncoder(img_size=model_cfg.img_size, patch_size=model_cfg.patch_size, stride=model_cfg.stride,
+                                featured_patch_dim=model_cfg.featured_patch_dim, cnn_feature_extractor_name=model_cfg.cnn_feature_extractor['name'],
+                                pre_trained=train_cfg.pre_trained, pool_dim=getattr(model_cfg, 'pool_dim', 1),
+                                use_token_mixer=getattr(model_cfg, 'use_token_mixer', True))
+
+    # Encoder의 최종 그리드 크기를 반영하여 num_encoder_patches 계산
+    num_encoder_patches = encoder.num_encoder_patches
+
     decoder_params = {
         'num_encoder_patches': num_encoder_patches,
         'num_labels': num_labels,
@@ -825,15 +860,13 @@ def main():
         'decoder_ff_ratio': model_cfg.decoder_ff_ratio,
         'dropout': model_cfg.dropout,
         'positional_encoding': model_cfg.positional_encoding,
+        'pos_encoding_type': getattr(model_cfg, 'pos_encoding_type', '2d'),
         'res_attention': model_cfg.res_attention,
         'save_attention': model_cfg.save_attention,
     }
     decoder_args = SimpleNamespace(**decoder_params)
 
-    encoder = PatchConvEncoder(img_size=model_cfg.img_size, patch_size=model_cfg.patch_size, stride=model_cfg.stride,
-                                featured_patch_dim=model_cfg.featured_patch_dim, cnn_feature_extractor_name=model_cfg.cnn_feature_extractor['name'],
-                                pre_trained=train_cfg.pre_trained)
-    decoder = DecoderBackbone(args=decoder_args) # models.py의 Model 클래스
+    decoder = DecoderBackbone(args=decoder_args)
     
     classifier = Classifier(num_decoder_patches=model_cfg.num_decoder_patches,
                             featured_patch_dim=model_cfg.featured_patch_dim, num_labels=num_labels, dropout=model_cfg.dropout)
@@ -849,7 +882,6 @@ def main():
         optimizer_name = getattr(train_cfg, 'optimizer', 'adamw').lower()
         logging.info("="*50)
         if optimizer_name == 'sgd':
-            # SGD 옵티마이저에 필요한 파라미터들을 train_cfg에서 가져옵니다.
             momentum = getattr(train_cfg, 'momentum', 0.9)
             weight_decay = getattr(train_cfg, 'weight_decay', 0.0001)
             logging.info(f"옵티마이저: SGD (lr={train_cfg.lr}, momentum={momentum}, weight_decay={weight_decay})")
@@ -867,15 +899,12 @@ def main():
             momentum = getattr(train_cfg, 'momentum', 0.0)
             logging.info(f"옵티마이저: RMSprop (lr={train_cfg.lr}, weight_decay={weight_decay}, momentum={momentum})")
             optimizer = optim.RMSprop(model.parameters(), lr=train_cfg.lr, weight_decay=weight_decay, momentum=momentum)
-        else:
-            # 기본값 또는 'adamw'로 설정된 경우
+        else: # adamw
             weight_decay = getattr(train_cfg, 'weight_decay', 0.01)
             logging.info(f"옵티마이저: AdamW (lr={train_cfg.lr}, weight_decay={weight_decay})")
             optimizer = optim.AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=weight_decay)
 
-        # scheduler_params가 없으면 빈 객체로 초기화
         scheduler_params = getattr(train_cfg, 'scheduler_params', SimpleNamespace())
-
         scheduler_name = getattr(train_cfg, 'scheduler', 'none').lower()
         if scheduler_name == 'multisteplr':
             milestones = getattr(train_cfg, 'milestones', [])
@@ -890,15 +919,13 @@ def main():
         else:
             logging.info("스케줄러를 사용하지 않습니다.")
 
-        # 훈련 시에는 train_loader와 valid_loader 사용
         train(run_cfg, train_cfg, model, optimizer, scheduler, train_loader, valid_loader, device, run_dir_path, class_names, pos_weight)
 
         logging.info("="*50)
         logging.info("훈련 완료. 최종 모델 성능을 테스트 세트로 평가합니다.")
-        final_acc = inference(run_cfg, model_cfg, model, test_loader, device, run_dir_path, timestamp, mode_name="Test", class_names=class_names)
+        final_acc = inference(run_cfg, model_cfg, model, test_loader, device, run_dir_path, timestamp, misclassified_dir, mode_name="Test", class_names=class_names)
 
         # --- 그래프 생성 ---
-        # 로그 파일 이름은 setup_logging에서 생성된 패턴을 기반으로 함
         log_filename = f"log_{timestamp}.log"
         log_file_path = os.path.join(run_dir_path, log_filename)
         if final_acc is not None:
@@ -910,20 +937,13 @@ def main():
             plot_and_save_compiled_graph(run_dir_path, timestamp)
 
     elif run_cfg.mode == 'inference':
-        # 추론 모드에서는 test_loader를 사용해 성능 평가
-        # onnx_inference_path가 지정된 경우, model 객체는 필요 없으므로 None을 전달합니다.
         onnx_inference_path = getattr(run_cfg, 'onnx_inference_path', None)
         if onnx_inference_path and os.path.exists(onnx_inference_path):
             logging.info(f"'{onnx_inference_path}' ONNX 파일 평가를 위해 PyTorch 모델 생성을 건너뜁니다.")
-            inference(run_cfg, model_cfg, None, test_loader, device, run_dir_path, timestamp, mode_name="Inference", class_names=class_names)
+            inference(run_cfg, model_cfg, None, test_loader, device, run_dir_path, timestamp, misclassified_dir, mode_name="Inference", class_names=class_names)
         else:
-            # 모델 생성 후 파라미터 수 로깅
             log_model_parameters(model)
-            inference(run_cfg, model_cfg, model, test_loader, device, run_dir_path, timestamp, mode_name="Inference", class_names=class_names)
+            inference(run_cfg, model_cfg, model, test_loader, device, run_dir_path, timestamp, misclassified_dir, mode_name="Inference", class_names=class_names)
 
-
-# =============================================================================
-# 5. 메인 실행 블록
-# =============================================================================
 if __name__ == '__main__':
     main()
