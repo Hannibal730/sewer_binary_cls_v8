@@ -159,6 +159,7 @@ model:
   res_attention: true        # 디코더 레이어 간에 어텐션 스코어를 전달하는 잔차 어텐션 사용 여부.
   save_attention: true       # 추론 시 어텐션 맵을 저장할지 여부. True로 설정하면 시각화에 사용할 수 있습니다.
   num_plot_attention: 50     # 어텐션 맵을 시각화하여 저장할 최대 샘플 수.
+  attention_interpolation_mode: 'nearest' # 어텐션 맵 시각화 보간법. 'bilinear' (부드럽게) 또는 'nearest' (픽셀 단위).
 
 # =============================================================================
 # 5. Baseline 모델 설정 (baseline.py 전용)

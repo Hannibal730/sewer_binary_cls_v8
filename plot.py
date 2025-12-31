@@ -431,6 +431,8 @@ def plot_and_save_attention_maps(attention_maps, image_tensor, save_dir, img_siz
         image = image.permute(1, 2, 0).contiguous().numpy().clip(0, 1)
 
         # 3. 어텐션 맵 차원 정보 추출
+        interp_mode = getattr(model_cfg, 'attention_interpolation_mode', 'bilinear')
+
         num_heads, num_queries, num_patches = attention_maps.shape
         grid_size = int(num_patches**0.5)
         if grid_size * grid_size != num_patches:
@@ -477,12 +479,15 @@ def plot_and_save_attention_maps(attention_maps, image_tensor, save_dir, img_siz
                 attn_map_2d = attention_maps[head, query_patch].view(1, 1, grid_size, grid_size)
                 
                 # 원본 이미지 크기로 업샘플링
-                upscaled_map = F.interpolate(attn_map_2d, size=(img_size, img_size), mode='bilinear', align_corners=False)
+                if interp_mode == 'nearest':
+                    upscaled_map = F.interpolate(attn_map_2d, size=(img_size, img_size), mode='nearest')
+                else:
+                    upscaled_map = F.interpolate(attn_map_2d, size=(img_size, img_size), mode=interp_mode, align_corners=False)
                 upscaled_map = upscaled_map.squeeze().numpy()
 
                 # 원본 이미지와 히트맵 그리기
                 ax.imshow(image, extent=(0, img_size, 0, img_size))
-                ax.imshow(upscaled_map, cmap='jet', alpha=0.3, extent=(0, img_size, 0, img_size))
+                ax.imshow(upscaled_map, cmap='jet', alpha=0.3, extent=(0, img_size, 0, img_size), interpolation=interp_mode)
 
                 # 변수명을 명확히 하고, 제목에 Query_patch를 사용하여 객관적인 정보를 표시합니다.
                 ax.set_title(f'Head {head+1} / Query_patch {query_patch+1}')
@@ -498,11 +503,14 @@ def plot_and_save_attention_maps(attention_maps, image_tensor, save_dir, img_siz
             
             # 1D -> 2D 그리드로 변환 및 업샘플링
             attn_map_2d = avg_attn_map.view(1, 1, grid_size, grid_size)
-            upscaled_map = F.interpolate(attn_map_2d, size=(img_size, img_size), mode='bilinear', align_corners=False)
+            if interp_mode == 'nearest':
+                upscaled_map = F.interpolate(attn_map_2d, size=(img_size, img_size), mode='nearest')
+            else:
+                upscaled_map = F.interpolate(attn_map_2d, size=(img_size, img_size), mode=interp_mode, align_corners=False)
             upscaled_map = upscaled_map.squeeze().numpy()
             
             ax_avg.imshow(image, extent=(0, img_size, 0, img_size))
-            ax_avg.imshow(upscaled_map, cmap='jet', alpha=0.3, extent=(0, img_size, 0, img_size))
+            ax_avg.imshow(upscaled_map, cmap='jet', alpha=0.3, extent=(0, img_size, 0, img_size), interpolation=interp_mode)
             
             ax_avg.set_title(f'Average / Query_patch {query_patch+1}')
             ax_avg.axis('off')
@@ -522,13 +530,16 @@ def plot_and_save_attention_maps(attention_maps, image_tensor, save_dir, img_siz
             
             # 1D -> 2D 그리드로 변환 및 업샘플링
             attn_map_2d = head_attn_map.view(1, 1, grid_size, grid_size)
-            upscaled_map = F.interpolate(attn_map_2d, size=(img_size, img_size), mode='bilinear', align_corners=False)
+            if interp_mode == 'nearest':
+                upscaled_map = F.interpolate(attn_map_2d, size=(img_size, img_size), mode='nearest')
+            else:
+                upscaled_map = F.interpolate(attn_map_2d, size=(img_size, img_size), mode=interp_mode, align_corners=False)
             upscaled_map = upscaled_map.squeeze().numpy()
 
             # 시각화
             plt.figure(figsize=(8, 8))
             plt.imshow(image, extent=(0, img_size, 0, img_size))
-            plt.imshow(upscaled_map, cmap='jet', alpha=0.3, extent=(0, img_size, 0, img_size))
+            plt.imshow(upscaled_map, cmap='jet', alpha=0.3, extent=(0, img_size, 0, img_size), interpolation=interp_mode)
             plt.axis('off')
             # plt.title(f'Attention Map - Head {head+1}') # 제목(title)을 제거합니다.
             head_save_path = os.path.join(output_folder, f"{base_name}_head{head+1}.png")
@@ -543,12 +554,15 @@ def plot_and_save_attention_maps(attention_maps, image_tensor, save_dir, img_siz
 
         # 1D -> 2D 그리드로 변환 및 업샘플링
         attn_map_2d = layer_avg_map.view(1, 1, grid_size, grid_size)
-        upscaled_map = F.interpolate(attn_map_2d, size=(img_size, img_size), mode='bilinear', align_corners=False)
+        if interp_mode == 'nearest':
+            upscaled_map = F.interpolate(attn_map_2d, size=(img_size, img_size), mode='nearest')
+        else:
+            upscaled_map = F.interpolate(attn_map_2d, size=(img_size, img_size), mode=interp_mode, align_corners=False)
         upscaled_map = upscaled_map.squeeze().numpy()
 
         plt.figure(figsize=(8, 8))
         plt.imshow(image, extent=(0, img_size, 0, img_size))
-        plt.imshow(upscaled_map, cmap='jet', alpha=0.3, extent=(0, img_size, 0, img_size))
+        plt.imshow(upscaled_map, cmap='jet', alpha=0.3, extent=(0, img_size, 0, img_size), interpolation=interp_mode)
         plt.axis('off')
         avg_save_path = os.path.join(output_folder, f"{base_name}_avg.png")
         plt.savefig(avg_save_path, bbox_inches='tight')
