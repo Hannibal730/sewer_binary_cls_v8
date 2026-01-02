@@ -507,6 +507,9 @@ def inference(run_cfg, model_cfg, model, data_loader, device, run_dir_path, time
             for _ in range(10):
                 _ = model(single_dummy_input)
 
+        # 웜업 과정에서 발생한 메모리 피크를 제외하기 위해 통계 초기화
+        torch.cuda.reset_peak_memory_stats(device)
+
         # 실제 시간 측정
         # 구간별 시간 측정을 위한 이벤트 생성
         start_event = torch.cuda.Event(enable_timing=True)

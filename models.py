@@ -370,7 +370,7 @@ class Embedding4Decoder(nn.Module):
 
         if self.adaptive_initial_query:
             latent_queries = self.W_Q_init(self.learnable_queries)
-            latent_queries = latent_queries.unsqueeze(0).repeat(bs, 1, 1)
+            latent_queries = latent_queries.unsqueeze(0).expand(bs, -1, -1)
 
             k_init = self.W_K_init(seq_encoder_patches)
             v_init = self.W_V_init(seq_encoder_patches) 
@@ -381,7 +381,7 @@ class Embedding4Decoder(nn.Module):
             seq_decoder_patches = torch.bmm(latent_attn_weights, v_init)
         else:
             learnable_queries = self.W_Q_init(self.learnable_queries)
-            seq_decoder_patches = learnable_queries.unsqueeze(0).repeat(bs, 1, 1)
+            latent_queries = latent_queries.unsqueeze(0).expand(bs, -1, -1)
 
         return seq_encoder_patches, seq_decoder_patches
             
