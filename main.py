@@ -44,6 +44,7 @@ except ImportError:
 
 import warnings
 warnings.filterwarnings("ignore", message="Glyph") 
+warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
 
 from plot import plot_and_save_train_val_accuracy_graph, plot_and_save_val_accuracy_graph, plot_and_save_confusion_matrix, plot_and_save_attention_maps, plot_and_save_f1_normal_graph, plot_and_save_loss_graph, plot_and_save_lr_graph, plot_and_save_compiled_graph
 
@@ -232,7 +233,7 @@ def evaluate(run_cfg, model, data_loader, device, criterion, loss_function_name,
     
     show_log = getattr(run_cfg, 'show_log', True)
     progress_bar = tqdm(data_loader, desc=desc, leave=False, disable=not show_log)
-    with torch.no_grad():
+    with torch.inference_mode():
         for images, labels, _ in progress_bar: # 파일명은 사용하지 않으므로 _로 받음
             images, labels = images.to(device), labels.to(device)
 
@@ -503,7 +504,7 @@ def inference(run_cfg, model_cfg, model, data_loader, device, run_dir_path, time
         torch.cuda.reset_peak_memory_stats(device)
         
         # 시간 측정을 위한 예열(warm-up)
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(10):
                 _ = model(single_dummy_input)
 
@@ -521,7 +522,7 @@ def inference(run_cfg, model_cfg, model, data_loader, device, run_dir_path, time
         # 각 반복의 시간을 저장하기 위한 리스트
         iteration_times = {'encoder': [], 'decoder': [], 'classifier': [], 'total': []}
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(num_iterations):
                 start_event.record()
                 # 1. Encoder 구간
@@ -561,14 +562,14 @@ def inference(run_cfg, model_cfg, model, data_loader, device, run_dir_path, time
         logging.info("CUDA를 사용할 수 없어 CPU 추론 시간을 측정합니다.")
         
         # CPU 시간 측정을 위한 예열(warm-up)
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(10):
                 _ = model(single_dummy_input)
 
         # 실제 시간 측정
         num_iterations = 100
         iteration_times = []
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(num_iterations):
                 start_time = time.time()
                 _ = model(single_dummy_input)
@@ -602,7 +603,7 @@ def inference(run_cfg, model_cfg, model, data_loader, device, run_dir_path, time
     show_log = getattr(run_cfg, 'show_log', True)
     progress_bar = tqdm(data_loader, desc=f"[{mode_name}]", leave=False, disable=not show_log)
     
-    with torch.no_grad():
+    with torch.inference_mode():
         for images, labels, filenames in progress_bar:
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
@@ -681,7 +682,7 @@ def inference(run_cfg, model_cfg, model, data_loader, device, run_dir_path, time
             for sample_images, sample_labels, sample_filenames in data_loader:
                 if saved_count >= num_to_save: break
                 sample_images = sample_images.to(device)
-                with torch.no_grad():
+                with torch.inference_mode():
                     outputs = model(sample_images)
                 _, predicted_indices = torch.max(outputs.data, 1)
                 batch_attention_maps = model.decoder.embedding4decoder.decoder.layers[-1].attn
@@ -826,6 +827,8 @@ def main():
 
     if device.type == 'cuda':
         logging.info(f"CUDA 사용 가능. GPU 사용을 시작합니다. (Device: {torch.cuda.get_device_name(0)})")
+        # [최적화] 입력 크기가 고정된 경우 cuDNN 벤치마크 활성화
+        torch.backends.cudnn.benchmark = True
     else:
         if use_cuda_if_available:
             logging.warning("config.yaml에서 CUDA 사용이 활성화되었지만, 사용 가능한 CUDA 장치를 찾을 수 없습니다. CPU를 사용합니다.")

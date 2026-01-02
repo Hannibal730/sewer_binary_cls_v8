@@ -298,6 +298,9 @@ def main():
     use_cuda = getattr(run_cfg, 'cuda', True)
     device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
     logging.info(f"Device: {device}")
+    
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
 
     # 4. 데이터 준비
     logging.info(f"Loading data from '{args.img_dir}'...")
@@ -417,7 +420,7 @@ def main():
     logging.info("Starting inference loop...")
     progress_bar = tqdm(test_loader, desc="Inference", leave=False)
     
-    with torch.no_grad():
+    with torch.inference_mode():
         for images, _, filenames in progress_bar:
             images = images.to(device)
             outputs = model(images)

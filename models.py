@@ -478,14 +478,14 @@ class _MultiheadAttention(nn.Module):
         k_s = self.W_K(K).view(bs, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v_s = self.W_V(V).view(bs, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        attn_scores = torch.einsum('bhqd, bhkd -> bhqk', q_s, k_s) * self.scale
+        attn_scores = torch.matmul(q_s, k_s.transpose(-2, -1)) * self.scale
         
         if prev is not None: attn_scores = attn_scores + prev
         
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)
 
-        output = torch.einsum('bhqk, bhkd -> bhqd', attn_weights, v_s)
+        output = torch.matmul(attn_weights, v_s)
         output = output.permute(0, 2, 1, 3).contiguous().view(bs, -1, self.num_heads * self.head_dim)
         
         output = self.concatheads2emb(output)
