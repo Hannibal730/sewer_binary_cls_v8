@@ -1,4 +1,4 @@
-# Sewer Binary Classification v7
+# Sewer Binary Classification v8
 
 ## 🚀 간단 추론 모듈 (`inference.py`)
 
